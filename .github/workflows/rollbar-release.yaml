@@ -1,0 +1,189 @@
+# Rollbar release: builds the gitops-server image and the weave-gitops Helm chart
+# from this fork and publishes them to GHCR under the rollbar org.
+#
+#   image: ghcr.io/rollbar/weave-gitops/gitops-server:<version>
+#   chart: oci://ghcr.io/rollbar/charts/weave-gitops --version <version without "v">
+#
+# The upstream workflows (ci.yaml, release.yaml, ...) are disabled in this fork;
+# see ROLLBAR.md for the full procedure.
+name: Rollbar release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version in tag form, e.g. v0.39.1-rollbar.1"
+        required: true
+        default: v0.39.1-rollbar.1
+  push:
+    tags: ["v*-rollbar.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rollbar-release-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ inputs.version || github.ref_name }}
+  IMAGE: ghcr.io/${{ github.repository }}/gitops-server
+  CHART_REPO: oci://ghcr.io/${{ github.repository_owner }}/charts
+  SOURCE_URL: https://github.com/${{ github.repository }}
+
+jobs:
+  vars:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      chart_version: ${{ steps.v.outputs.chart_version }}
+    steps:
+      - id: v
+        run: |
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::version '$VERSION' must look like v0.39.1-rollbar.1"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "chart_version=${VERSION#v}" >> "$GITHUB_OUTPUT"
+
+  image:
+    name: Build gitops-server (${{ matrix.platform }})
+    needs: [vars]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set build env
+        run: |
+          echo "LDFLAGS=$(make echo-ldflags VERSION=$VERSION CHART_VERSION=${{ needs.vars.outputs.chart_version }})" >> "$GITHUB_ENV"
+          echo "PLATFORM_PAIR=${{ matrix.platform }}" | tr '/' '-' >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: gitops-server.dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            LDFLAGS=${{ env.LDFLAGS }}
+            GIT_COMMIT=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ env.SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.title=gitops-server
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: Push multi-arch manifest
+    needs: [vars, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.inspect.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.source=$SOURCE_URL" \
+            --annotation "index:org.opencontainers.image.revision=$GITHUB_SHA" \
+            --annotation "index:org.opencontainers.image.version=$VERSION" \
+            -t "$IMAGE:$VERSION" \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Inspect
+        id: inspect
+        run: |
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "### Image" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$IMAGE:$VERSION@$digest\`" >> "$GITHUB_STEP_SUMMARY"
+
+  chart:
+    name: Package and push Helm chart
+    needs: [vars, manifest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: "v3.17.0"
+
+      - name: Point the chart at the Rollbar build
+        env:
+          CHART_VERSION: ${{ needs.vars.outputs.chart_version }}
+        run: |
+          yq -i '.version = strenv(CHART_VERSION) | .appVersion = strenv(VERSION)' charts/gitops-server/Chart.yaml
+          yq -i '.image.repository = strenv(IMAGE)' charts/gitops-server/values.yaml
+          yq '.name, .version, .appVersion' charts/gitops-server/Chart.yaml
+          yq '.image' charts/gitops-server/values.yaml
+
+      - name: Helm registry login
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Package and push chart
+        run: |
+          helm package charts/gitops-server -d /tmp/chart
+          helm push /tmp/chart/weave-gitops-*.tgz "$CHART_REPO" 2>&1 | tee /tmp/push.log
+          echo "### Chart" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$CHART_REPO/weave-gitops --version ${{ needs.vars.outputs.chart_version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          awk '/Digest: /{print "digest `" $2 "`"}' /tmp/push.log >> "$GITHUB_STEP_SUMMARY"
