@@ -8,10 +8,15 @@ upstream `main`.
 
 ## What differs from upstream
 
-The diff is additive only, so syncing with upstream never conflicts:
+The diff is additive apart from one deletion, so syncing with upstream rarely
+conflicts:
 
 - `.github/workflows/rollbar-release.yaml` builds and publishes the release.
 - `ROLLBAR.md` (this file).
+- `.github/dependabot.yml` is deleted: Dependabot is off in this fork (version
+  updates via that file, security updates via the repository setting;
+  vulnerability alerts stay on). If an upstream merge brings the file back or
+  conflicts on it, keep it deleted (`git rm .github/dependabot.yml`).
 - Repository settings, not files: the upstream workflows `CI`, `ossf`,
   `Release`, `repo-stats` and `Upgrade flux` are disabled
   (`gh workflow disable`). They would fail or publish under the wrong names
