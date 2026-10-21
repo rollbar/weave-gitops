@@ -19,8 +19,9 @@ The diff is additive only, so syncing with upstream never conflicts:
   `Docs` stays enabled; its deploy job only runs in the weaveworks org.
 
 The chart in `charts/gitops-server` is left untouched in git. The release
-workflow rewrites `version`, `appVersion` and `image.repository` at packaging
-time.
+workflow rewrites `version`, `appVersion`, `image.repository` and `image.tag`
+at packaging time (upstream hard-codes `image.tag` in `values.yaml`, so it has
+to be overridden too).
 
 ## Release
 

@@ -173,7 +173,7 @@ jobs:
           CHART_VERSION: ${{ needs.vars.outputs.chart_version }}
         run: |
           yq -i '.version = strenv(CHART_VERSION) | .appVersion = strenv(VERSION)' charts/gitops-server/Chart.yaml
-          yq -i '.image.repository = strenv(IMAGE)' charts/gitops-server/values.yaml
+          yq -i '.image.repository = strenv(IMAGE) | .image.tag = strenv(VERSION)' charts/gitops-server/values.yaml
           yq '.name, .version, .appVersion' charts/gitops-server/Chart.yaml
           yq '.image' charts/gitops-server/values.yaml
 
